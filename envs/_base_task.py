@@ -172,7 +172,7 @@ class Base_Task(gym.Env):
         def check(times):
             nonlocal self, is_stable, actors_list, actors_pose_list
             for _ in range(times):
-                self.scene.step()
+                self._step_simulation()
                 for idx, actor in enumerate(actors_list):
                     actors_pose_list[idx].append(actor.get_pose())
 
@@ -186,11 +186,23 @@ class Base_Task(gym.Env):
 
         is_stable = True
         for _ in range(2000):
-            self.scene.step()
+            self._step_simulation()
         for idx, actor in enumerate(actors_list):
             actors_pose_list.append([actor.get_pose()])
         check(500)
         return is_stable, unstable_list
+
+    def _step_simulation(self):
+        """Advance physics and notify task tracking and optional rollout recording."""
+        self.scene.step()
+        self._after_simulation_step()
+        observer = getattr(self, "simulation_observer", None)
+        if observer is not None:
+            observer(self)
+
+    def _after_simulation_step(self):
+        """Task-specific physics monitoring; inactive for ordinary tasks."""
+        pass
 
     def play_once(self):
         pass
@@ -412,7 +424,7 @@ class Base_Task(gym.Env):
             **kwags,
         )
         self.cameras.load_camera(self.scene)
-        self.scene.step()  # run a physical step
+        self._step_simulation()  # run a physical step
         self.scene.update_render()  # sync pose from SAPIEN to renderer
 
     # =========================================================== Sapien ===========================================================
@@ -941,7 +953,7 @@ class Base_Task(gym.Env):
                 )
                 now_right_id += 1
 
-            self.scene.step()
+            self._step_simulation()
             if self.render_freq and i % self.render_freq == 0:
                 self._update_render()
                 self.viewer.render()
@@ -1534,7 +1546,7 @@ class Base_Task(gym.Env):
                     right_gripper["per_step"],
                 )  # TODO
 
-            self.scene.step()
+            self._step_simulation()
 
             if self.render_freq and control_idx % self.render_freq == 0:
                 self._update_render()
@@ -1724,7 +1736,7 @@ class Base_Task(gym.Env):
 
                 now_right_id += 1
 
-            self.scene.step()
+            self._step_simulation()
             self._update_render()
                 
             if self.check_success():
