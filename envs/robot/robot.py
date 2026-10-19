@@ -16,6 +16,31 @@ from .planner import CuroboPlanner
 import torch.multiprocessing as mp
 
 
+def _planner_start_qpos(qpos, qlimits):
+    """Copy measured joints, correcting only <=1e-4 rad joint-limit roundoff.
+
+    Physics can settle slightly outside an articulation limit. Correct that
+    planner input by 1e-6 rad inside the limit, without changing the physical
+    articulation. Larger violations and nonfinite values remain for the planner
+    to reject. Caller-supplied ``last_qpos`` is not measured state and bypasses
+    this correction in the planning methods below.
+    """
+    current = np.asarray(qpos)
+    result = np.array(current, copy=True,
+                      dtype=current.dtype if np.issubdtype(current.dtype, np.floating) else float)
+    limits = np.asarray(qlimits, dtype=float)
+    if result.ndim != 1 or limits.shape != (result.size, 2):
+        raise ValueError("Joint positions and articulation limits must have shapes (N,) and (N, 2)")
+    lower, upper = limits[:, 0], limits[:, 1]
+    with np.errstate(invalid="ignore"):
+        finite = np.isfinite(result)
+        below = finite & np.isfinite(lower) & (result < lower) & (lower - result <= 1e-4)
+        above = finite & np.isfinite(upper) & (result > upper) & (result - upper <= 1e-4)
+        result[below] = np.minimum(lower[below] + 1e-6, upper[below])
+        result[above] = np.maximum(upper[above] - 1e-6, lower[above])
+    return result
+
+
 class Robot:
 
     def __init__(self, scene, need_topp=False, **kwargs):
@@ -363,7 +388,7 @@ class Robot:
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="left")
         if last_qpos is None:
-            now_qpos = self.left_entity.get_qpos()
+            now_qpos = _planner_start_qpos(self.left_entity.get_qpos(), self.left_entity.get_qlimits())
         else:
             now_qpos = deepcopy(last_qpos)
         target_lst_copy = deepcopy(target_lst)
@@ -398,7 +423,7 @@ class Robot:
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="right")
         if last_qpos is None:
-            now_qpos = self.right_entity.get_qpos()
+            now_qpos = _planner_start_qpos(self.right_entity.get_qpos(), self.right_entity.get_qlimits())
         else:
             now_qpos = deepcopy(last_qpos)
         target_lst_copy = deepcopy(target_lst)
@@ -433,7 +458,7 @@ class Robot:
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="left")
         if last_qpos is None:
-            now_qpos = self.left_entity.get_qpos()
+            now_qpos = _planner_start_qpos(self.left_entity.get_qpos(), self.left_entity.get_qlimits())
         else:
             now_qpos = deepcopy(last_qpos)
 
@@ -467,7 +492,7 @@ class Robot:
         if constraint_pose is not None:
             constraint_pose = self.get_constraint_pose(constraint_pose, arm_tag="right")
         if last_qpos is None:
-            now_qpos = self.right_entity.get_qpos()
+            now_qpos = _planner_start_qpos(self.right_entity.get_qpos(), self.right_entity.get_qlimits())
         else:
             now_qpos = deepcopy(last_qpos)
 
