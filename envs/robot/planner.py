@@ -76,6 +76,7 @@ try:
                 world_config,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
+                collision_cache={"obb": 32},
             )
 
             self.motion_gen = MotionGen(motion_gen_config)
@@ -85,6 +86,7 @@ try:
                 world_config,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
+                collision_cache={"obb": 32},
                 num_graph_seeds=1,
             )
             self.motion_gen_batch = MotionGen(motion_gen_config)
