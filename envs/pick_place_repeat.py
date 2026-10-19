@@ -1,0 +1,327 @@
+"""Pick/place task environment, scripted policy, and physical completion tracking."""
+
+import math
+
+import numpy as np
+import sapien
+
+from ._base_task import Base_Task
+from .utils import ArmTag, create_box
+
+
+class pick_place_repeat(Base_Task):
+    """A procedural single-block task supporting RoboTwin's bimanual embodiments."""
+
+    def setup_demo(self, **kwargs):
+        # Reset before Base_Task steps physics, including when reusing an instance.
+        self._state = None
+        self.repeat_count = kwargs.get("repeat_count", 3)
+        self.lift_height = float(kwargs.get("lift_height", 0.05))
+        self.block_half_size = float(kwargs.get("block_half_size", 0.025))
+        self.block_x_range = self._range(
+            kwargs.get("block_x_range", [0.12, 0.22]), "block_x_range"
+        )
+        self.block_y_range = self._range(
+            kwargs.get("block_y_range", [-0.05, 0.05]), "block_y_range"
+        )
+        self.block_yaw_range = self._range(
+            kwargs.get("block_yaw_range", [-0.35, 0.35]), "block_yaw_range"
+        )
+        self.ready_position_tolerance = float(kwargs.get("ready_position_tolerance", 0.02))
+        self.ready_angle_tolerance = float(kwargs.get("ready_angle_tolerance", 0.15))
+        self.settle_seconds = float(kwargs.get("settle_seconds", 0.20))
+        if not 0.005 <= self.block_half_size <= 0.04:
+            raise ValueError("block_half_size must be between 0.005 and 0.04 meters")
+        for name in ("ready_position_tolerance", "ready_angle_tolerance", "settle_seconds"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        state_kwargs = {
+            "lift_height": self.lift_height,
+            "position_tolerance": float(kwargs.get("position_tolerance", 0.02)),
+            "height_tolerance": float(kwargs.get("height_tolerance", 0.008)),
+        }
+        # Validate all task parameters before constructing expensive simulator state.
+        PickPlaceRepeatState(self.repeat_count, (0.0, 0.0, 0.0), **state_kwargs)
+        super()._init_task_env_(**kwargs)
+        self.initial_block_pose = self.block.get_pose()
+        self.robot.set_origin_endpose()
+        self._ready_left_pose = np.array(self.robot.left_original_pose, dtype=float)
+        self._ready_right_pose = np.array(self.robot.right_original_pose, dtype=float)
+        self._right_gripper_entities = [
+            joint.child_link.entity for joint, _, _ in self.robot.right_gripper
+        ]
+        self._right_gripper_entities.extend(
+            link.entity
+            for link in self.robot.right_entity.get_links()
+            if link.get_name() in self.robot.right_fix_gripper_name
+        )
+        self._block_body = self.block.actor.find_component_by_type(
+            sapien.physx.PhysxRigidDynamicComponent
+        )
+        self._state = PickPlaceRepeatState(
+            self.repeat_count, self.initial_block_pose.p, **state_kwargs
+        )
+        times = "time" if self.repeat_count == 1 else "times"
+        self.set_instruction(
+            f"Use the right arm to lift and place the block {self.repeat_count} {times}."
+        )
+        self.info["info"] = {"{A}": "block", "{a}": "right", "{N}": str(self.repeat_count)}
+        self.info["task_progress"] = self.get_task_progress()
+
+    @staticmethod
+    def _range(values, name):
+        if len(values) != 2 or not all(math.isfinite(v) for v in values) or values[0] > values[1]:
+            raise ValueError(f"{name} must be a finite [minimum, maximum] pair")
+        return values
+
+    def load_actors(self):
+        x = np.random.uniform(*self.block_x_range)
+        y = np.random.uniform(*self.block_y_range)
+        yaw = np.random.uniform(*self.block_yaw_range)
+        self.block = create_box(
+            scene=self,
+            pose=sapien.Pose(
+                [x, y, 0.741 + self.block_half_size],
+                [math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)],
+            ),
+            half_size=[self.block_half_size] * 3,
+            color=(0.90, 0.18, 0.12),
+            name="pick_place_repeat_block",
+        )
+        self.add_prohibit_area(self.block, padding=0.10)
+
+    def _contact_flags(self):
+        right_contact = table_contact = False
+        for contact in self.scene.get_contacts():
+            entities = [body.entity for body in contact.bodies]
+            if self.block.actor not in entities or not contact.points:
+                continue
+            other = entities[1] if entities[0] == self.block.actor else entities[0]
+            right_contact |= other in self._right_gripper_entities
+            table_contact |= other == self.table
+        return right_contact, table_contact
+
+    def _pose_is_ready(self, current, target):
+        current = np.asarray(current, dtype=float)
+        if np.linalg.norm(current[:3] - target[:3]) > self.ready_position_tolerance:
+            return False
+        cosine = abs(np.dot(current[3:], target[3:])) / (
+            np.linalg.norm(current[3:]) * np.linalg.norm(target[3:])
+        )
+        return 2 * math.acos(np.clip(cosine, 0.0, 1.0)) <= self.ready_angle_tolerance
+
+    def _after_simulation_step(self):
+        if self._state is None:
+            return
+        right_contact, table_contact = self._contact_flags()
+        self._state.update(
+            self.block.get_pose().p,
+            dt=self.scene.get_timestep(),
+            right_contact=right_contact,
+            table_contact=table_contact,
+            gripper_closed=self.is_right_gripper_close(),
+            gripper_open=self.is_right_gripper_open(),
+            arms_ready=(
+                self._pose_is_ready(self.robot.get_left_ee_pose(), self._ready_left_pose)
+                and self._pose_is_ready(self.robot.get_right_ee_pose(), self._ready_right_pose)
+            ),
+            block_still=(
+                np.linalg.norm(self._block_body.linear_velocity) < 0.025
+                and np.linalg.norm(self._block_body.angular_velocity) < 0.25
+            ),
+        )
+
+    def _settle(self):
+        for _ in range(math.ceil(self.settle_seconds / self.scene.get_timestep())):
+            self._step_simulation()
+
+    def play_once(self):
+        """Grasp once, execute N physical lift/touchdown cycles, release, return."""
+        right = ArmTag("right")
+        self.move(self.grasp_actor(self.block, arm_tag=right, pre_grasp_dis=0.08))
+        if not self.plan_success:
+            return self._episode_info()
+        # Preserve the settled grasp orientation; correct XYZ from the actual block
+        # position so small contact offsets cannot accumulate over repeated cycles.
+        for repetition in range(self.repeat_count):
+            target = np.array(self.robot.get_right_ee_pose(), dtype=float)
+            target[:3] += self.initial_block_pose.p - self.block.get_pose().p
+            target[2] += self.lift_height + 0.005  # tracking margin: observed lift must reach 5 cm
+            self.move(self.move_to_pose(arm_tag=right, target_pose=target))
+            self._settle()
+            if not self.plan_success or self._state.failed_reason:
+                return self._episode_info()
+            if not self._state.lifted:
+                self.info["scripted_failure"] = "lift_not_observed"
+                return self._episode_info()
+
+            target = np.array(self.robot.get_right_ee_pose(), dtype=float)
+            target[:3] += self.initial_block_pose.p - self.block.get_pose().p
+            self.move(self.move_to_pose(arm_tag=right, target_pose=target))
+            self._settle()
+            if not self.plan_success or self._state.failed_reason:
+                return self._episode_info()
+            if self._state.completed_repeats != repetition + 1:
+                self.info["scripted_failure"] = "placement_not_observed"
+                return self._episode_info()
+
+        self.move(self.open_gripper(right))
+        self.move(self.move_by_displacement(arm_tag=right, z=0.08))
+        self.move(self.back_to_origin(arm_tag=right))
+        self._settle()
+        return self._episode_info()
+
+    def _episode_info(self):
+        self.info["task_progress"] = self.get_task_progress()
+        self.info["instruction"] = self.get_instruction()
+        return self.info
+
+    def get_task_progress(self):
+        return {} if self._state is None else self._state.snapshot()
+
+    def check_success(self):
+        return self._state is not None and self._state.success
+
+
+class PickPlaceRepeatState:
+    """Count observed lift/touchdown cycles, never scripted waypoint completions.
+
+    Touchdowns require support from the table and continued right-hand contact.
+    Releasing between cycles, losing the block, or performing an extra lift makes
+    the episode unsuccessful. Short contact gaps are tolerated by ``grip_grace``.
+    """
+
+    def __init__(
+        self,
+        repeat_count,
+        initial_position,
+        *,
+        lift_height=0.05,
+        position_tolerance=0.02,
+        height_tolerance=0.008,
+        touchdown_duration=0.04,
+        settle_duration=0.12,
+        grip_grace=0.12,
+    ):
+        if isinstance(repeat_count, bool) or not isinstance(repeat_count, int) or repeat_count < 1:
+            raise ValueError("repeat_count must be a positive integer")
+        for name, value in (
+            ("lift_height", lift_height),
+            ("position_tolerance", position_tolerance),
+            ("height_tolerance", height_tolerance),
+            ("touchdown_duration", touchdown_duration),
+            ("settle_duration", settle_duration),
+            ("grip_grace", grip_grace),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if height_tolerance >= lift_height:
+            raise ValueError("height_tolerance must be smaller than lift_height")
+        if len(initial_position) != 3 or not all(math.isfinite(v) for v in initial_position):
+            raise ValueError("initial_position must contain three finite coordinates")
+        self.repeat_count = repeat_count
+        self.initial_position = tuple(initial_position)
+        self.lift_height = lift_height
+        self.position_tolerance = position_tolerance
+        self.height_tolerance = height_tolerance
+        self.touchdown_duration = touchdown_duration
+        self.settle_duration = settle_duration
+        self.grip_grace = grip_grace
+        self.completed_repeats = 0
+        self.phase = "ready"
+        self.failed_reason = None
+        self.lifted = False
+        self.started = False
+        self.touchdown_time = 0.0
+        self.settled_time = 0.0
+        self.missing_contact_time = 0.0
+
+    @property
+    def success(self):
+        return self.phase == "success"
+
+    def _fail(self, reason):
+        self.failed_reason = reason
+        self.phase = "failed"
+
+    def update(
+        self,
+        position,
+        *,
+        dt,
+        right_contact,
+        table_contact,
+        gripper_closed,
+        gripper_open,
+        arms_ready,
+        block_still,
+    ):
+        if self.failed_reason is not None or self.success:
+            return
+        if dt <= 0 or not math.isfinite(dt):
+            raise ValueError("dt must be positive and finite")
+        if len(position) != 3 or not all(math.isfinite(v) for v in position):
+            self._fail("nonfinite_block_position")
+            return
+        height = position[2] - self.initial_position[2]
+        at_start = (
+            math.dist(position[:2], self.initial_position[:2]) <= self.position_tolerance
+            and abs(height) <= self.height_tolerance
+            and table_contact
+        )
+
+        if height < -0.05:
+            self._fail("block_fell_off_table")
+            return
+        if self.completed_repeats == self.repeat_count:
+            if height >= self.lift_height:
+                self._fail("extra_lift_after_requested_repeats")
+                return
+            self.phase = "returning" if gripper_open else "releasing"
+            finished = (
+                at_start and gripper_open and not right_contact and arms_ready and block_still
+            )
+            self.settled_time = self.settled_time + dt if finished else 0.0
+            if self.settled_time + 1e-9 >= self.settle_duration:
+                self.phase = "success"
+            return
+
+        if self.started:
+            if not gripper_closed:
+                self._fail("released_before_last_placement")
+                return
+            self.missing_contact_time = 0.0 if right_contact else self.missing_contact_time + dt
+            if self.missing_contact_time > self.grip_grace:
+                self._fail("lost_right_hand_grasp")
+                return
+
+        if not self.lifted:
+            if height + 1e-9 >= self.lift_height and right_contact and gripper_closed:
+                self.started = True
+                self.lifted = True
+                self.phase = "placing"
+            elif right_contact and gripper_closed:
+                self.phase = "lifting"
+            return
+
+        # A held block can jitter against stiff gripper drives while supported by
+        # the table. Require sustained support, not zero velocity under grasp load;
+        # physical settling is required after the final release instead.
+        held_touchdown = at_start and right_contact and gripper_closed
+        self.touchdown_time = self.touchdown_time + dt if held_touchdown else 0.0
+        if self.touchdown_time + 1e-9 >= self.touchdown_duration:
+            self.completed_repeats += 1
+            self.lifted = False
+            self.touchdown_time = 0.0
+            self.phase = "releasing" if self.completed_repeats == self.repeat_count else "lifting"
+
+    def snapshot(self):
+        return {
+            "repeat_count": self.repeat_count,
+            "completed_repeats": self.completed_repeats,
+            "phase": self.phase,
+            "success": self.success,
+            "failed": self.failed_reason is not None,
+            "failed_reason": self.failed_reason,
+        }
