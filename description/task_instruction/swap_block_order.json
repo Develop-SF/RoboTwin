@@ -1,0 +1,13 @@
+{
+  "full_description": "Two blocks start stacked. Reverse their original order: place the originally top block on the table and stack the originally bottom block on it. Either block may be red or blue; colors do not determine the goal.",
+  "schema": "No placeholders. Identify blocks by their original positions in the stack.",
+  "preference": "Describe the reversal relative to the original order, without specifying colors or a fixed table location.",
+  "seen": [
+    "Reverse the order of the two stacked blocks, putting the originally top block underneath the originally bottom block.",
+    "Swap the stack order: place the original top block on the table and the original bottom block on it."
+  ],
+  "unseen": [
+    "Rebuild the stack with its original bottom block on top and its original top block underneath.",
+    "Unstack these two blocks and restack them in the opposite order."
+  ]
+}
