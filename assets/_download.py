@@ -5,5 +5,4 @@ snapshot_download(
     allow_patterns=["background_texture.zip", "embodiments.zip", "objects.zip"],
     local_dir=".",
     repo_type="dataset",
-    resume_download=True,
 )
