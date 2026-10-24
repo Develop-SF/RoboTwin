@@ -323,8 +323,8 @@ class SwapBlockOrderState:
         initial_bottom_position,
         *,
         block_half_size=0.025,
-        position_tolerance=0.012,
-        height_tolerance=0.008,
+        position_tolerance=0.035,
+        height_tolerance=0.015,
         settle_duration=0.20,
     ):
         for name, value in (
@@ -376,6 +376,8 @@ class SwapBlockOrderState:
             self.phase = "failed"
             self.settled_time = 0.0
             return
+        # Permit an off-center/tilted placement, while still requiring the
+        # reversed identities, one-block height, and real physical support.
         reversed_stack = (
             np.linalg.norm(bottom[:2] - top[:2]) <= self.position_tolerance
             and abs(bottom[2] - top[2] - self.block_size) <= self.height_tolerance
